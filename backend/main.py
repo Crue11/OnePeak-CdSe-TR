@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
@@ -36,6 +37,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import RobustScaler
 
 DATA_PATH = Path(__file__).parent / "data" / "cdse_simulated_dataset.csv"
+CACHE_PATH = Path(__file__).parent / "model_cache.joblib"
 
 # Recalibrated 99th percentile of training z-scores for the 1D case.
 OOD_THRESHOLD = 2.29
@@ -60,7 +62,7 @@ def physics_inverse(temperature_c: float) -> float:
 
 def build_ensemble(X: np.ndarray, y: np.ndarray) -> tuple:
     rf = RandomForestRegressor(
-        n_estimators=400, max_features=0.5, criterion="absolute_error", random_state=42, n_jobs=-1
+        n_estimators=400, max_features=0.5, criterion="absolute_error", random_state=42, n_jobs=1
     )
     gb = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, loss="absolute_error", random_state=42)
     mlp = make_pipeline(RobustScaler(), MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=2000, random_state=42))
@@ -90,6 +92,7 @@ state = ModelState()
 
 
 def train_all() -> None:
+    print("[startup] training started", flush=True)
     df = pd.read_csv(DATA_PATH)
     train = df[df["split"].isin(["train_clean", "train_aug"])]
     test = df[df["split"] == "test_heldout"]
@@ -108,7 +111,7 @@ def train_all() -> None:
     state.test_mae = float(mean_absolute_error(y_test, y_pred))
     state.test_r2 = float(r2_score(y_test, y_pred))
 
-    state.ml_inverse = RandomForestRegressor(n_estimators=400, max_features=0.5, random_state=42, n_jobs=-1)
+    state.ml_inverse = RandomForestRegressor(n_estimators=400, max_features=0.5, random_state=42, n_jobs=1)
     state.ml_inverse.fit(train[["T"]], train["peak_pos_002"])
     # Padded to the intended 25-400C experimental design range: the simulated
     # data's actual extremes (~25.13-399.85) are noise-shifted off the nominal
@@ -126,16 +129,50 @@ def train_all() -> None:
         "temperatures": temperatures.tolist(),
     }
 
-    print(f"[startup] trained on {len(train)} rows. held-out MAE={state.test_mae:.2f} R2={state.test_r2:.3f}")
+    print(f"[startup] trained on {len(train)} rows. held-out MAE={state.test_mae:.2f} R2={state.test_r2:.3f}", flush=True)
 
 
 def ood_distance(x: float) -> float:
     return abs((x - state.mu) / state.std)
 
 
+CACHE_FIELDS = [
+    "forward_models",
+    "ml_inverse",
+    "mu",
+    "std",
+    "t_min",
+    "t_max",
+    "test_mae",
+    "test_r2",
+    "curve",
+]
+
+
+def save_cache() -> None:
+    joblib.dump({field: getattr(state, field) for field in CACHE_FIELDS}, CACHE_PATH, compress=3)
+
+
+def load_cache() -> bool:
+    if not CACHE_PATH.exists():
+        return False
+    data = joblib.load(CACHE_PATH)
+    for field in CACHE_FIELDS:
+        setattr(state, field, data[field])
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    train_all()
+    # criterion="absolute_error" makes the forward RandomForest fit slow
+    # (median-based splits have no incremental update, unlike mean-based
+    # squared_error); load a pre-trained cache instead of refitting on
+    # every cold start, which was blowing past Render's port-bind timeout.
+    if not load_cache():
+        train_all()
+        save_cache()
+    else:
+        print(f"[startup] loaded cached model. held-out MAE={state.test_mae:.2f} R2={state.test_r2:.3f}", flush=True)
     yield
 
 
