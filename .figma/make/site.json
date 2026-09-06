@@ -1,4 +1,5 @@
 {
+  "title": "CdSe OnePeak",
   "description": "Easily predict temperatures from X-ray scan data or visualize expected scan signatures at given temperatures, designed for non-technical users.",
   "robots": {
     "index": false
